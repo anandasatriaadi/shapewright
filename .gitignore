@@ -1,0 +1,32 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.python-version
+dist/
+build/
+
+# --- test / coverage ---
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+
+# --- shapewright runtime output ---
+shapewright_out/
+
+# --- local, machine-specific config ---
+opencode.json
+
+# --- unrelated personal 3D-printing scratch files in this workspace ---
+# (not part of shapewright; remove these lines to track them)
+aquarium_cleaner.py
+v60_filter_case.py
+render_case.py
+render_preview.py
+preview.py
+output/
+preview/
+stl/
