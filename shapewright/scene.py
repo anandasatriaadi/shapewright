@@ -16,6 +16,7 @@ Conventions
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from typing import Iterable, Sequence
 
 from build123d import (
@@ -56,6 +57,7 @@ from build123d import (
 
 from . import printer
 from .select import describe, select
+from .store import ProjectStore
 
 _PLANES = {"XY": Plane.XY, "XZ": Plane.XZ, "YZ": Plane.YZ,
            "yz": Plane.YZ, "xz": Plane.XZ, "xy": Plane.XY}
@@ -85,50 +87,191 @@ class SceneError(Exception):
 
 
 class Scene:
-    def __init__(self) -> None:
-        self.objs: dict = {}
+    """
+    A set of named solids.
+
+    In-memory by default. Pass ``store=ProjectStore(...)`` (or use
+    :meth:`Scene.open`) to keep solids as BREP files on disk and hold only a
+    bounded LRU cache in RAM. Measurements for ``info`` / ``list_objects`` are
+    kept separately, so listing never loads geometry.
+    """
+
+    def __init__(self, store=None, cache_size: int = 24, undo_limit: int = 100,
+                 persist_every: int = 16) -> None:
+        self.store = store
+        self.cache_size = int(cache_size)
+        self.undo_limit = int(undo_limit)
+        self.persist_every = max(1, int(persist_every))
+        self.objs: "OrderedDict[str, object]" = OrderedDict()  # live solids
+        self._ref: dict[str, str] = {}     # name -> brep filename  (persistent)
+        self._meta: dict[str, dict] = {}   # name -> measurements   (persistent)
         self.code: list[str] = []
-        self._undo: list = []
+        self._undo: list[dict] = []
+        self._dirty = 0
+
+    # -- persistence -------------------------------------------------------
+    @property
+    def persistent(self) -> bool:
+        return self.store is not None
+
+    @classmethod
+    def open(cls, name: str, root: str | None = None, cache_size: int = 24,
+             undo_limit: int = 100, persist_every: int = 16) -> "Scene":
+        """Open (or create) a disk-backed project."""
+        store = ProjectStore(name, root=root, cache_size=cache_size)
+        manifest = store.load_manifest()
+        store.adopt(manifest)
+        scene = cls(store=store, cache_size=cache_size, undo_limit=undo_limit,
+                    persist_every=persist_every)
+        for obj_name, info in manifest.get("objects", {}).items():
+            scene._ref[obj_name] = info["file"]
+            scene._meta[obj_name] = {k: v for k, v in info.items() if k != "file"}
+        scene.code = list(manifest.get("code", []))
+        return scene
+
+    def _measure(self, name: str, shape) -> dict:
+        bb = shape.bounding_box()
+        c = shape.center()
+        return {
+            "name": name,
+            "bbox_mm": [round(bb.size.X, 3), round(bb.size.Y, 3), round(bb.size.Z, 3)],
+            "min_mm": [round(bb.min.X, 3), round(bb.min.Y, 3), round(bb.min.Z, 3)],
+            "max_mm": [round(bb.max.X, 3), round(bb.max.Y, 3), round(bb.max.Z, 3)],
+            "center_mm": [round(c.X, 3), round(c.Y, 3), round(c.Z, 3)],
+            "volume_cm3": round(shape.volume / 1000.0, 3),
+            "area_cm2": round(shape.area / 100.0, 3),
+            "solids": len(shape.solids()),
+            "faces": len(shape.faces()),
+            "edges": len(shape.edges()),
+        }
+
+    def _persist(self) -> None:
+        if not self.persistent:
+            return
+        self.store.save_manifest({
+            "objects": {n: {"file": self._ref[n], **self._meta[n]} for n in self._ref},
+            "code": self.code,
+        })
+        self._dirty = 0
+        self._gc()          # safe here: the manifest on disk now matches _ref
+
+    def _touch(self) -> None:
+        """Persist the manifest.
+
+        Small projects flush on every change (so they are always discoverable
+        and reopenable); once a project is large the manifest is written every
+        ``persist_every`` mutations to avoid O(n^2) JSON churn.
+        """
+        if not self.persistent:
+            return
+        self._dirty += 1
+        every = self.persist_every if len(self._ref) > 24 else 1
+        if self._dirty >= every:
+            self._persist()
+
+    def flush(self) -> None:
+        """Force the manifest to disk and collect unreferenced BREP files."""
+        self._persist()
+
+    def _gc(self) -> int:
+        if not self.persistent:
+            return 0
+        live = set(self._ref.values())
+        for snap in self._undo:
+            live.update(snap.get("ref", {}).values())
+        return self.store.gc(live)
+
+    def cache_stats(self) -> dict:
+        if not self.persistent:
+            return {"persistent": False, "objects": len(self.objs),
+                    "cached": len(self.objs)}
+        s = self.store.stats()
+        s["persistent"] = True
+        s["objects"] = len(self._ref)
+        return s
 
     # -- plumbing ----------------------------------------------------------
     def _push_undo(self) -> None:
-        self._undo.append((dict(self.objs), list(self.code)))
-        if len(self._undo) > 100:
+        if self.persistent:
+            # snapshot only names + file refs; the shapes themselves stay on disk
+            self._undo.append({"ref": dict(self._ref), "meta": dict(self._meta),
+                               "code": list(self.code)})
+        else:
+            self._undo.append({"objs": OrderedDict(self.objs), "code": list(self.code)})
+        if len(self._undo) > self.undo_limit:
             self._undo.pop(0)
 
     def undo(self) -> bool:
         if not self._undo:
             return False
-        self.objs, self.code = self._undo.pop()
+        snap = self._undo.pop()
+        self.code = snap["code"]
+        if self.persistent:
+            self._ref, self._meta = snap["ref"], snap["meta"]
+            self.objs.clear()               # reload lazily from disk
+            self.store.clear_cache()
+        else:
+            self.objs = snap["objs"]
+        self._touch()
         return True
+
+    def _evict(self) -> None:
+        if not self.persistent:
+            return
+        while len(self.objs) > self.cache_size:
+            self.objs.popitem(last=False)
 
     def _set(self, name: str, shape, code: str | None = None) -> str:
         self._push_undo()
+        if self.persistent:
+            self._ref[name] = self.store.write(name, shape)
+            self._meta[name] = self._measure(name, shape)
         self.objs[name] = shape
+        if self.persistent:
+            self.objs.move_to_end(name)
+            self._evict()
         if code:
             self.code.append(code)
+        self._touch()
         return name
 
     def get(self, name: str):
-        if name not in self.objs:
-            raise SceneError(f"no object named {name!r}. Have: {sorted(self.objs)}")
-        return self.objs[name]
+        shape = self.objs.get(name)
+        if shape is not None:
+            if self.persistent:
+                self.objs.move_to_end(name)
+            return shape
+        if self.persistent and name in self._ref:
+            shape = self.store.read(self._ref[name])
+            self.objs[name] = shape
+            self._evict()
+            return shape
+        raise SceneError(f"no object named {name!r}. Have: {sorted(self.names())}")
 
     def names(self) -> list[str]:
-        return list(self.objs)
+        return list(self._ref) if self.persistent else list(self.objs)
 
     def delete(self, name: str) -> str:
         self._push_undo()
+        if self.persistent:
+            self._ref.pop(name, None)
+            self._meta.pop(name, None)
         self.objs.pop(name, None)
         self.code.append(f"del {name}")
+        self._touch()
         return name
 
     def duplicate(self, name: str, new_name: str) -> str:
         return self._set(new_name, self.get(name), f"{new_name} = {name}")
 
     def reset(self) -> None:
+        self._push_undo()
+        if self.persistent:
+            self._ref.clear()
+            self._meta.clear()
         self.objs.clear()
         self.code.clear()
+        self.flush()
 
     # -- primitives --------------------------------------------------------
     def box(self, name, length, width, height, at=(0, 0, 0), rotation=(0, 0, 0),
@@ -371,24 +514,14 @@ class Scene:
 
     # -- queries -----------------------------------------------------------
     def info(self, name) -> dict:
-        s = self.get(name)
-        bb = s.bounding_box()
-        c = s.center()
-        return {
-            "name": name,
-            "bbox_mm": [round(bb.size.X, 3), round(bb.size.Y, 3), round(bb.size.Z, 3)],
-            "min_mm": [round(bb.min.X, 3), round(bb.min.Y, 3), round(bb.min.Z, 3)],
-            "max_mm": [round(bb.max.X, 3), round(bb.max.Y, 3), round(bb.max.Z, 3)],
-            "center_mm": [round(c.X, 3), round(c.Y, 3), round(c.Z, 3)],
-            "volume_cm3": round(s.volume / 1000.0, 3),
-            "area_cm2": round(s.area / 100.0, 3),
-            "solids": len(s.solids()),
-            "faces": len(s.faces()),
-            "edges": len(s.edges()),
-        }
+        if self.persistent and name in self._meta:
+            d = dict(self._meta[name])
+            d["cached"] = name in self.objs
+            return d
+        return self._measure(name, self.get(name))
 
     def list_objects(self) -> list[dict]:
-        return [self.info(n) for n in self.objs]
+        return [self.info(n) for n in self.names()]
 
     def edges(self, name, spec="all") -> list[dict]:
         return describe(self.get(name), "edges", spec)

@@ -12,7 +12,10 @@ import os
 import tempfile
 import unittest
 
-os.environ.setdefault("SHAPEWRIGHT_OUT", tempfile.mkdtemp(prefix="shapewright_test_"))
+_TEST_DIR = tempfile.mkdtemp(prefix="shapewright_test_")
+_PROJ_ROOT = os.path.join(_TEST_DIR, "projects")
+os.environ.setdefault("SHAPEWRIGHT_OUT", _TEST_DIR)
+os.environ.setdefault("SHAPEWRIGHT_HOME", _PROJ_ROOT)
 
 from shapewright.server import OUT, mcp  # noqa: E402
 
@@ -64,7 +67,15 @@ SMOKE: list[tuple[str, dict]] = [
     ("list_objects", {}),
     ("duplicate_object", {"name": "hex", "new_name": "hex2"}),
     ("delete_object", {"name": "hex2"}),
+    ("project_open", {"name": "smoke_project", "root": _PROJ_ROOT, "cache_size": 4}),
+    ("create_box", {"name": "persisted", "length": 10, "width": 10, "height": 10}),
+    ("object_info", {"name": "persisted"}),
+    ("project_info", {}),
+    ("project_save", {}),
+    ("project_list", {"root": _PROJ_ROOT}),
     ("undo", {}),
+    ("project_close", {}),
+    ("project_delete", {"name": "smoke_project", "root": _PROJ_ROOT}),
     ("reset", {}),
 ]
 
@@ -164,6 +175,18 @@ class TestServerBehaviour(unittest.IsolatedAsyncioTestCase):
         await _call("undo", {})
         text = _text(await _call("list_objects", {}))
         self.assertNotIn('"temp"', text)
+
+    async def test_project_persists_across_sessions(self):
+        root = tempfile.mkdtemp(prefix="sw_persist_")
+        await _call("project_open", {"name": "p1", "root": root})
+        await _call("create_box", {"name": "kept", "length": 10, "width": 10, "height": 10})
+        await _call("project_close", {})
+        # a *new* session against the same directory must see the object
+        await _call("project_open", {"name": "p1", "root": root})
+        text = _text(await _call("object_info", {"name": "kept"}))
+        self.assertIn("10.0", text)
+        listing = _text(await _call("project_list", {"root": root}))
+        self.assertIn("p1", listing)
 
     async def test_main_entrypoint_calls_run(self):
         import shapewright.server as srv

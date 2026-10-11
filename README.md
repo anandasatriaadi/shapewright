@@ -81,6 +81,7 @@ Outputs (STL / STEP / render PNG / generated script) are written to
 
 ```
 SCENE     reset · undo · list_objects · object_info · duplicate_object · delete_object
+PROJECTS  project_open · project_list · project_info · project_save · project_close · project_delete
 
 PRIMITIVES (mm, centred on origin; place with at / rotation)
   create_box(name, length, width, height, corner=?)
@@ -150,6 +151,7 @@ python examples/tool_session.py     # writes ./shapewright_out/
 ```
 shapewright/
   scene.py     stateful scene of named solids + build123d ops + script log
+  store.py     disk-backed projects (BREP per part, manifest, LRU cache, gc)
   select.py    the edge/face selector language
   render.py    tiny numpy+Pillow software renderer (no GPU / no OCC viewer)
   printer.py   overhang / bed-fit / filament analysis
@@ -157,12 +159,13 @@ shapewright/
   server.py    MCP tool surface (mcp 2.x MCPServer, stdio)
 tests/         unit tests
 examples/      a scripted agent session
+benchmarks/    memory / disk benchmarks
 ```
 
 ## Tests
 
 ```bash
-python -m unittest discover -s tests      # 118 tests
+python -m unittest discover -s tests      # 133 tests
 python -m coverage run --source=shapewright -m unittest discover -s tests
 python -m coverage report                 # ~95% line coverage
 ```
@@ -171,8 +174,9 @@ python -m coverage report                 # ~95% line coverage
 |-------|-------|--------|
 | `test_scene_ops.py` | 52 | one focused test per geometry operation (volumes, bboxes, single-solid checks, error paths) |
 | `test_selectors.py` | 23 | the whole selector language — signed normals, kinds, metrics, error cases |
-| `test_server.py` | 12 | server behaviour + **tool-coverage guard** + error surfacing |
+| `test_server.py` | 13 | server behaviour + **tool-coverage guard** + error surfacing |
 | `test_printer_render.py` | 8 | printability analysis + renderer |
+| `test_store.py` | 14 | disk projects: persistence, lazy loading, LRU cache, gc |
 | `test_basics.py` | 23 | original smoke coverage |
 
 **Tool-coverage guard:** `test_server.py::test_every_tool_is_covered` introspects
@@ -181,6 +185,59 @@ sequence — so adding a tool without a test breaks the build. Invalid inputs ra
 a readable `ToolError` (e.g. `ValueError: unknown selector 'wat'`).
 
 The ~5% not covered is defensive `except` branches and the `__main__` guard line.
+
+## Persistence & memory
+
+By default the scene lives in RAM — one global dict of solids. For real work,
+open a **project**: solids are then written to disk as OpenCASCADE **BREP**
+files (one versioned file per part) and only a small **LRU cache** stays in
+memory.
+
+```python
+project_open(name="bracket", cache_size=24)   # ~/.local/share/shapewright/…
+# … design as usual …
+project_save()                                 # flush the manifest
+project_close()
+project_list() · project_info() · project_delete(name)
+```
+
+Why it's more than "dump to disk":
+
+* **Many projects, many parts.** Each part is `<name>.<seq>.brep`; the manifest
+  (`project.json`) holds the measurements *and* the op-log, so
+  `export_script` still reproduces the whole design.
+* **Listing never loads geometry.** `list_objects` / `object_info` read cached
+  measurements, so they are fast and flat in memory.
+* **Undo is ref-based.** Both undo and GC work on filenames, so the undo stack
+  no longer pins superseded solids; `gc` deletes versions nothing references.
+* **BREP, not STEP** — round-trips ~10× faster in ~6× less space.
+* Small projects flush on every change (always reopenable); large ones debounce
+  the manifest write to avoid O(n²) JSON churn.
+
+### Benchmark
+
+`benchmarks/memory_bench.py` — each scenario runs in its own subprocess and
+retained memory is measured after `gc` + `malloc_trim`. N parts = `box` +
+`fillet` each, disk `cache_size=8`:
+
+| parts | mode | retained growth | build | `list_objects` | on disk |
+|---:|---|---:|---:|---:|---:|
+| 30 | memory | 9.2 MB | 0.14 s | 47 ms | — |
+| 30 | disk | 8.9 MB | 0.32 s | 0.02 ms | 287 KB |
+| 200 | memory | 19.8 MB | 0.95 s | 297 ms | — |
+| 200 | disk | 10.8 MB | 1.66 s | 0.05 ms | 1.5 MB |
+| 600 | memory | 44.1 MB | 2.82 s | 894 ms | — |
+| 600 | disk | 13.9 MB | 5.44 s | 0.14 ms | 4.3 MB |
+
+* Memory grows with project size in memory mode but stays roughly flat on disk
+  (**−68 %** at 600 parts).
+* `list_objects` is **10³–10⁴× faster** because it never touches geometry.
+* The cost is ~2× slower edits (BREP + manifest writes) and ~7 KB per part.
+* The ~390 MB RSS baseline is build123d/OCC import; it is the same for both.
+
+```bash
+python benchmarks/memory_bench.py --n 600 --cache 8
+```
 
 ## Known limits / roadmap
 

@@ -21,6 +21,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from . import render as R
 from . import script as script_mod
 from .scene import Scene, SceneError
+from .store import delete_project, list_projects
 
 OUT = os.environ.get("SHAPEWRIGHT_OUT", os.path.abspath("shapewright_out"))
 scene = Scene()
@@ -39,7 +40,10 @@ mcp = MCPServer(
         "Edge/face selectors are strings, e.g. 'parallel:Z & at:zmax', "
         "'type:circle & radius>2', 'concave', 'normal:Z+', 'near:(0,0,10)'. "
         "Combine with & (and) and | (or). Call help for the full cheat-sheet.\n\n"
-        "Use get_edges / get_faces to inspect before selecting."
+        "Use get_edges / get_faces to inspect before selecting.\n\n"
+        "For persistent work use project_open(name): solids are then stored as "
+        "BREP files on disk (one per part) and only a small LRU cache stays in "
+        "memory, so you can keep many projects and very large scenes."
     ),
 )
 
@@ -97,6 +101,53 @@ def reset() -> str:
 def undo() -> str:
     """Undo the last operation (handy if a boolean or fillet did the wrong thing)."""
     return "undone" if scene.undo() else "nothing to undo"
+
+
+# --------------------------------------------------------------------------
+# projects (disk-backed scenes)
+# --------------------------------------------------------------------------
+@_tool
+def project_open(name: str, root: Optional[str] = None, cache_size: int = 24) -> dict:
+    """Open (or create) a disk-backed project: solids are stored as BREP files and only a small LRU cache stays in RAM."""
+    global scene
+    scene = Scene.open(name, root=root, cache_size=cache_size)
+    st = scene.cache_stats()
+    return {"project": name, "path": st["path"], "objects": scene.names(),
+            "cache_size": cache_size, "note": "shapes persist to disk; re-open later with the same name"}
+
+
+@_tool
+def project_list(root: Optional[str] = None) -> list[dict]:
+    """List projects saved on disk."""
+    return list_projects(root)
+
+
+@_tool
+def project_save() -> dict:
+    """Flush the project manifest to disk (BREP solids are already written on every change)."""
+    scene.flush()
+    return {"saved": True, **scene.cache_stats()}
+
+
+@_tool
+def project_info() -> dict:
+    """Storage + cache stats for the current scene (objects, disk bytes, cache hits/misses)."""
+    return scene.cache_stats()
+
+
+@_tool
+def project_close() -> str:
+    """Close the current project and start a fresh in-memory scene."""
+    global scene
+    scene.flush()
+    scene = Scene()
+    return "closed - back to an in-memory scene"
+
+
+@_tool
+def project_delete(name: str, root: Optional[str] = None) -> dict:
+    """Delete a project directory from disk."""
+    return {"deleted": delete_project(name, root)}
 
 
 @_tool
@@ -447,7 +498,11 @@ HELP_TEXT = """\
 shapewright - 3D design tools (all sizes in mm)
 
 SCENE
-  reset, list_objects, object_info(name), duplicate_object, delete_object
+  reset, undo, list_objects, object_info(name), duplicate_object, delete_object
+
+PROJECTS (persist to disk; keep several)
+  project_open(name, root, cache_size)  # shapes become BREP files; lazy-loaded
+  project_list()  project_info()  project_close()  project_delete(name)
 
 PRIMITIVES            (centred on the origin; use `at`/`rotation` to place)
   create_box(name,length,width,height,at,rotation,corner)
